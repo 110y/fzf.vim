@@ -736,18 +736,19 @@ function! s:ag_handler(lines, has_column)
     return
   endif
 
-  let first = list[0]
-  try
-    call s:open(cmd, first.filename)
-    execute first.lnum
-    if a:has_column
-      call cursor(0, first.col)
-    endif
-    normal! zz
-  catch
-  endtry
-
-  call s:fill_quickfix(list)
+  " NOTE: (110y) modified this logic to open all selected buffers
+  "       based on https://github.com/junegunn/fzf.vim/issues/40#issuecomment-156181609
+  for entry in list
+    try
+      call s:open(cmd, entry.filename)
+      execute entry.lnum
+      if a:has_column
+        call cursor(0, entry.col)
+      endif
+      normal! zz
+    catch
+    endtry
+  endfor
 endfunction
 
 " query, [[ag options], options]
