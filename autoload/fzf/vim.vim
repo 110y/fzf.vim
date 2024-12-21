@@ -841,7 +841,7 @@ function! s:ag_to_qf(line)
   return dict
 endfunction
 
-function! s:ag_handler(name, lines)
+function! fzf#vim#grep_handler(name, lines)
   if len(a:lines) < 2
     return
   endif
@@ -908,7 +908,7 @@ function! fzf#vim#grep(grep_command, ...)
   endif
 
   function! opts.sink(lines) closure
-    return s:ag_handler(get(opts, 'name', name), a:lines)
+    return fzf#vim#grep_handler(get(opts, 'name', name), a:lines)
   endfunction
   let opts['sink*'] = remove(opts, 'sink')
   try
@@ -946,7 +946,7 @@ function! fzf#vim#grep2(command_prefix, query, ...)
     call remove(args, 0)
   endif
   function! opts.sink(lines) closure
-    return s:ag_handler(name, a:lines)
+    return fzf#vim#grep_handler(name, a:lines)
   endfunction
   let opts['sink*'] = remove(opts, 'sink')
   return s:fzf(name, opts, args)
