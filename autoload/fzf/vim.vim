@@ -53,7 +53,8 @@ function! s:bash()
 
   let custom_bash = s:conf('preview_bash', '')
   let git_bash = 'C:\Program Files\Git\bin\bash.exe'
-  let candidates = filter(s:is_win ? [custom_bash, 'bash', git_bash] : [custom_bash, 'bash'], 'len(v:val)')
+  let scoop_git_bash = exists('$GIT_INSTALL_ROOT') ? $GIT_INSTALL_ROOT . '\bin\bash.exe' : ''
+  let candidates = filter(s:is_win ? [custom_bash, git_bash, scoop_git_bash, 'bash'] : [custom_bash, 'bash'], 'len(v:val)')
 
   let found = filter(map(copy(candidates), 'exepath(v:val)'), 'len(v:val)')
   if empty(found)
@@ -93,7 +94,7 @@ function! s:escape_for_bash(path)
   return escape(path, ' ')
 endfunction
 
-let s:min_version = '0.23.0'
+let s:min_version = '0.56.0'
 let s:is_win = has('win32') || has('win64')
 let s:is_wsl_bash = s:is_win && (exepath('bash') =~? 'Windows[/\\]system32[/\\]bash.exe$')
 let s:layout_keys = ['window', 'up', 'down', 'left', 'right']
@@ -577,16 +578,46 @@ endfunction
 " ------------------------------------------------------------------
 " Colors
 " ------------------------------------------------------------------
+function! s:colors_exit(code)
+  if exists('s:colors_name')
+    if a:code > 0 && s:colors_name != g:colors_name
+      execute 'colo' s:colors_name
+    endif
+    unlet s:colors_name
+  endif
+  call fzf#vim#ipc#stop()
+endfunction
+
 function! fzf#vim#colors(...)
   let colors = split(globpath(&rtp, "colors/*.vim"), "\n")
   if has('packages')
     let colors += split(globpath(&packpath, "pack/*/opt/*/colors/*.vim"), "\n")
   endif
-  return s:fzf('colors', {
-  \ 'source':  fzf#vim#_uniq(map(colors, "substitute(fnamemodify(v:val, ':t'), '\\..\\{-}$', '', '')")),
+  let colors = fzf#vim#_uniq(map(colors, "fnamemodify(v:val, ':t')[:-5]"))
+
+  " Put the current colorscheme at the top
+  if exists('g:colors_name')
+    let s:colors_name = g:colors_name
+    let colors = [g:colors_name] + filter(colors, 'g:colors_name != v:val')
+  endif
+
+  let spec = {
+  \ 'source':  colors,
   \ 'sink':    'colo',
-  \ 'options': '+m --prompt="Colors> "'
-  \}, a:000)
+  \ 'options': ['+m', '--prompt', 'Colors> ']
+  \}
+
+  if !a:1 " We can't set up IPC in fullscreen mode in Vim
+    let fifo = fzf#vim#ipc#start({ msg -> execute('colo '.msg) })
+    if len(fifo)
+      call extend(spec.options, ['--no-tmux', '--no-padding', '--no-margin', '--bind', 'focus:execute-silent:echo {} > '.fifo])
+      let spec.exit = s:function('s:colors_exit')
+      let maxwidth = max(map(copy(colors), 'strwidth(v:val)'))
+      let spec.window = { 'width': maxwidth + 8, 'height': len(colors) + 5 }
+    endif
+  endif
+
+  call s:fzf('colors', spec, a:000)
 endfunction
 
 " ------------------------------------------------------------------
@@ -834,7 +865,11 @@ endfunction
 " ------------------------------------------------------------------
 function! s:ag_to_qf(line)
   let parts = matchlist(a:line, '\(.\{-}\)\s*:\s*\(\d\+\)\%(\s*:\s*\(\d\+\)\)\?\%(\s*:\(.*\)\)\?')
-  let dict = {'filename': &acd ? fnamemodify(parts[1], ':p') : parts[1], 'lnum': parts[2], 'text': parts[4]}
+  let file = &acd ? fnamemodify(parts[1], ':p') : parts[1]
+  if has('win32unix') && file !~ '/'
+    let file = substitute(file, '\', '/', 'g')
+  endif
+  let dict = {'filename': file, 'lnum': parts[2], 'text': parts[4]}
   if len(parts[3])
     let dict.col = parts[3]
   endif
@@ -846,7 +881,17 @@ function! fzf#vim#grep_handler(name, lines)
     return
   endif
 
-  let list = map(filter(a:lines[1:], 'len(v:val)'), 's:ag_to_qf(v:val)')
+  let multi_line = min([s:conf('grep_multi_line', 0), 1])
+  let lines = []
+  if multi_line && executable('perl')
+    for idx in range(1, len(a:lines), multi_line + 1)
+      call add(lines, join(a:lines[idx:idx + multi_line], ''))
+    endfor
+  else
+    let lines = a:lines[1:]
+  endif
+
+  let list = map(filter(lines, 'len(v:val)'), 's:ag_to_qf(v:val)')
   if empty(list)
     return
   endif
@@ -885,6 +930,22 @@ function! fzf#vim#ag_raw(command_suffix, ...)
   return call('fzf#vim#grep', extend(['ag --nogroup --column --color '.a:command_suffix, 1], a:000))
 endfunction
 
+function! s:grep_multi_line(opts)
+  " TODO: Non-global option
+  let multi_line = s:conf('grep_multi_line', 0)
+  if multi_line && executable('perl')
+    let opts = copy(a:opts)
+    let extra = ['--read0', '--highlight-line']
+    if multi_line > 1
+      call extend(extra, ['--gap', multi_line - 1])
+    endif
+    let opts.options = extend(copy(opts.options), extra)
+    return [opts, printf(" | perl -pe 's/\\n/%s/; s/^([^:]+:){2,3}/$&\\n  /'", '\0')]
+  endif
+
+  return [a:opts, '']
+endfunction
+
 " command (string), [spec (dict)], [fullscreen (bool)]
 function! fzf#vim#grep(grep_command, ...)
   let args = copy(a:000)
@@ -911,9 +972,11 @@ function! fzf#vim#grep(grep_command, ...)
     return fzf#vim#grep_handler(get(opts, 'name', name), a:lines)
   endfunction
   let opts['sink*'] = remove(opts, 'sink')
+  let [opts, suffix] = s:grep_multi_line(opts)
+  let command = a:grep_command . suffix
   try
     let prev_default_command = $FZF_DEFAULT_COMMAND
-    let $FZF_DEFAULT_COMMAND = a:grep_command
+    let $FZF_DEFAULT_COMMAND = command
     return s:fzf(name, opts, args)
   finally
     let $FZF_DEFAULT_COMMAND = prev_default_command
@@ -933,15 +996,20 @@ function! fzf#vim#grep2(command_prefix, query, ...)
   endfor
   let words = empty(words) ? ['grep'] : words
   let name = join(words, '-')
+  let fallback = s:is_win ? '' : ' || :'
   let opts = {
-  \ 'source': ':',
+  \ 'source': s:is_win ? 'cd .' : ':',
   \ 'options': ['--ansi', '--prompt', toupper(name).'> ', '--query', a:query,
   \             '--disabled',
-  \             '--bind', 'start:reload:'.a:command_prefix.' '.fzf#shellescape(a:query),
-  \             '--bind', 'change:reload:'.a:command_prefix.' {q} || :',
   \             '--multi', '--bind', 'alt-a:select-all,alt-d:deselect-all',
   \             '--delimiter', ':', '--preview-window', '+{2}-/2']
   \}
+
+  let [opts, suffix] = s:grep_multi_line(opts)
+  let suffix = escape(suffix, '{')
+  call extend(opts.options, ['--bind', 'start:reload:'.a:command_prefix.' '.fzf#shellescape(a:query).suffix])
+  call extend(opts.options, ['--bind', 'change:reload:'.a:command_prefix.' {q}'.suffix.fallback])
+
   if len(args) && type(args[0]) == s:TYPE.bool
     call remove(args, 0)
   endif
@@ -1079,6 +1147,10 @@ function! fzf#vim#tags(query, ...)
   if !executable('perl')
     return s:warn('Tags command requires perl')
   endif
+  if len(a:query) && !executable('readtags')
+    return s:warn('readtags from universal-ctags is required to pre-filter tags with a prefix')
+  endif
+
   if empty(tagfiles())
     call inputsave()
     echohl WarningMsg
@@ -1141,18 +1213,18 @@ endfunction
 " ------------------------------------------------------------------
 " Commands
 " ------------------------------------------------------------------
-let s:nbs = nr2char(0xa0)
+let s:tab = "\t"
 
 function! s:format_cmd(line)
   return substitute(a:line, '\C \([A-Z]\S*\) ',
-        \ '\=s:nbs.s:yellow(submatch(1), "Function").s:nbs', '')
+        \ '\=s:tab.s:yellow(submatch(1), "Function").s:tab', '')
 endfunction
 
 function! s:command_sink(lines)
   if len(a:lines) < 2
     return
   endif
-  let cmd = matchstr(a:lines[1], s:nbs.'\zs\S*\ze'.s:nbs)
+  let cmd = matchstr(a:lines[1], s:tab.'\zs\S*\ze'.s:tab)
   if empty(a:lines[0])
     call feedkeys(':'.cmd.(a:lines[1][0] == '!' ? '' : ' '), 'n')
   else
@@ -1164,7 +1236,7 @@ let s:fmt_excmd = '   '.s:blue('%-38s', 'Statement').'%s'
 
 function! s:format_excmd(ex)
   let match = matchlist(a:ex, '^|:\(\S\+\)|\s*\S*\(.*\)')
-  return printf(s:fmt_excmd, s:nbs.match[1].s:nbs, s:strip(match[2]))
+  return printf(s:fmt_excmd, s:tab.match[1].s:tab, s:strip(match[2]))
 endfunction
 
 function! s:excmds()
@@ -1202,7 +1274,7 @@ function! fzf#vim#commands(...)
   \ 'source':  extend(extend(list[0:0], map(list[1:], 's:format_cmd(v:val)')), s:excmds()),
   \ 'sink*':   s:function('s:command_sink'),
   \ 'options': '--ansi --expect '.s:conf('commands_expect', 'ctrl-x').
-  \            ' --tiebreak=index --header-lines 1 -x --prompt "Commands> " -n2,3,2..3 -d'.s:nbs}, a:000)
+  \            ' --tiebreak=index --header-lines 1 -x --prompt "Commands> " -n2,3,2..3 --tabstop=1 -d "\t"'}, a:000)
 endfunction
 
 " ------------------------------------------------------------------
@@ -1210,7 +1282,11 @@ endfunction
 " ------------------------------------------------------------------
 
 function! s:format_change(bufnr, offset, item)
-  return printf("%3d  %s  %4d  %3d  %s", a:bufnr, s:yellow(printf('%6s', a:offset)), a:item.lnum, a:item.col, getbufline(a:bufnr, a:item.lnum)[0])
+  let buflines = getbufline(a:bufnr, a:item.lnum)
+  if empty(buflines)
+    return ''
+  endif
+  return printf("%3d  %s  %4d  %3d  %s", a:bufnr, s:yellow(printf('%6s', a:offset)), a:item.lnum, a:item.col, buflines[0])
 endfunction
 
 function! s:changes_sink(lines)
@@ -1252,7 +1328,7 @@ function! fzf#vim#changes(...)
     if current
       let cursor = len(changes) - position_or_length
     endif
-    let all_changes += map(reverse(changes), { idx, val -> s:format_change(bufnr, s:format_change_offset(current, idx, cursor), val) })
+    let all_changes += filter(map(reverse(changes), { idx, val -> s:format_change(bufnr, s:format_change_offset(current, idx, cursor), val) }), '!empty(v:val)')
   endfor
 
   return s:fzf('changes', {
@@ -1291,37 +1367,52 @@ endfunction
 " Jumps
 " ------------------------------------------------------------------
 function! s:jump_format(line)
-  return substitute(a:line, '[0-9]\+', '\=s:yellow(submatch(0), "Number")', '')
+  let line = substitute(a:line, '[0-9]\+', '\=s:yellow(submatch(0), "Number")', '')
+  let line = substitute(line, '\s.\{-}\ze:[0-9]\+:', '\=s:green(submatch(0), "Directory")', '')
+  let line = substitute(line, '\%(:[0-9]\+\)\+:', '\=s:black(submatch(0), "NonText")', '')
+  return line
 endfunction
 
 function! s:jump_sink(lines)
   if len(a:lines) < 2
     return
   endif
-  call s:action_for(a:lines[0])
-  let idx = index(s:jumplist, a:lines[1])
-  if idx == -1
-    return
-  endif
-  let current = match(s:jumplist, '\v^\s*\>')
-  let delta = idx - current
+  keepjumps call s:action_for(a:lines[0])
+  let idx = str2nr(a:lines[1])
+  let delta = idx - s:jump_current - 1
   if delta < 0
     execute 'normal! ' . -delta . "\<C-O>"
   else
     execute 'normal! ' . delta . "\<C-I>"
   endif
+  normal! zvzz
 endfunction
 
 function! fzf#vim#jumps(...)
-  redir => cout
-  silent jumps
-  redir END
-  let s:jumplist = split(cout, '\n')
-  let current = -match(s:jumplist, '\v^\s*\>')
+  let [jumps, pos] = getjumplist()
+  if empty(jumps)
+    return s:warn('No jumps')
+  endif
+  let s:jumplist = []
+  for idx in range(len(jumps))
+    let jump = jumps[idx]
+    let loc = expand('#'.jump.bufnr.':p:~:.')
+    if empty(loc)
+      let loc = '[No Name]'
+    endif
+    let loc .= ':'.jump.lnum
+    if jump.col
+      let loc .= ':'.jump.col
+    endif
+    let line = printf('%-2d %s: %s', idx+1, loc, getbufoneline(jump.bufnr, jump.lnum))
+    call add(s:jumplist, line)
+  endfor
+  let s:jump_current = pos
+  let current = -pos-1
   return s:fzf('jumps', {
-  \ 'source'  : extend(s:jumplist[0:0], map(s:jumplist[1:], 's:jump_format(v:val)')),
+  \ 'source'  : map(s:jumplist, 's:jump_format(v:val)'),
   \ 'sink*'   : s:function('s:jump_sink'),
-  \ 'options' : '+m -x --ansi --tiebreak=index --cycle --scroll-off 999 --sync --bind start:pos:'.current.' --tac --header-lines 1 --tiebreak=begin --prompt "Jumps> "',
+  \ 'options' : ['+m', '-x', '--ansi', '--tiebreak=index', '--cycle', '--scroll-off=999', '--sync', '--bind', 'start:pos('.current.')+offset-middle', '--tac', '--tiebreak=begin', '--prompt', 'Jumps> ', '--preview-window', '+{3}-/2', '--tabstop=2', '--delimiter', '[:\s]+'],
   \ }, a:000)
 endfunction
 
@@ -1374,9 +1465,9 @@ endfunction
 function! s:format_win(tab, win, buf)
   let modified = getbufvar(a:buf, '&modified')
   let name = bufname(a:buf)
-  let name = empty(name) ? s:nbs.s:nbs.'[No Name]' : ' '.s:nbs.name
+  let name = empty(name) ? s:tab.s:tab.'[No Name]' : ' '.s:tab.name
   let active = tabpagewinnr(a:tab) == a:win
-  return (active? s:blue('>', 'Operator') : ' ') . name . s:nbs . (modified? s:red(' [+]', 'Exception') : '')
+  return (active? s:blue('>', 'Operator') : ' ') . name . s:tab . (modified? s:red(' [+]', 'Exception') : '')
 endfunction
 
 function! s:windows_sink(line)
@@ -1399,7 +1490,7 @@ function! fzf#vim#windows(...)
   return s:fzf('windows', {
   \ 'source':  extend(['Tab Win     Name'], lines),
   \ 'sink':    s:function('s:windows_sink'),
-  \ 'options': '+m --ansi --tiebreak=begin --header-lines=1 -d'.s:nbs}, a:000)
+  \ 'options': '+m --ansi --tiebreak=begin --header-lines=1 --tabstop=1 -d "\t"'}, a:000)
 endfunction
 
 " ------------------------------------------------------------------
@@ -1462,14 +1553,22 @@ function! s:commits(range, buffer_local, args)
 
   let args = copy(a:args)
   let log_opts = len(args) && type(args[0]) == type('') ? remove(args, 0) : ''
+  let with_preview = !s:is_win && &columns > s:wide
 
   if len(a:range) || a:buffer_local
     if !managed
       return s:warn('The current buffer is not in the working tree')
     endif
-    let source .= len(a:range)
-      \ ? join([printf(' -L %d,%d:%s --no-patch', a:range[0], a:range[1], fzf#shellescape(current)), log_opts])
-      \ : join([' --follow', log_opts, fzf#shellescape(current)])
+    if len(a:range)
+      let source .= join([printf(' -L %d,%d:%s --no-patch', a:range[0], a:range[1], fzf#shellescape(current)), log_opts])
+      if with_preview
+        let previewparams = join([printf('log -L %d,%d:%s', a:range[0], a:range[1], fzf#shellescape(current)), log_opts])
+        let previewfilter = " | awk '/commit {1}/ {flag=1;print;next} /^[^ ]*commit/{flag=0} flag' "
+        let previewcmd = prefix . previewparams .' --color=always '. previewfilter
+      endif
+    else
+      let source .= join([' --follow', log_opts, fzf#shellescape(current)])
+    endif
     let command = 'BCommits'
   else
     let source .= join([' --graph', log_opts])
@@ -1491,12 +1590,14 @@ function! s:commits(range, buffer_local, args)
     let options.options[-1] .= ',ctrl-d'
   endif
 
-  if !s:is_win && &columns > s:wide
+  if with_preview
+    if !len(a:range)
+      let orderfile = tempname()
+      call writefile([current[len(s:git_root)+1:]], orderfile)
+      let previewcmd = 'echo {} | grep -o "[a-f0-9]\{7,\}" | head -1 | xargs ' . prefix . 'show -O'.fzf#shellescape(orderfile).' --format=format: --color=always '
+    endif
     let suffix = executable('delta') ? '| delta --width $FZF_PREVIEW_COLUMNS' : ''
-    let orderfile = tempname()
-    call writefile([current[len(s:git_root)+1:]], orderfile)
-    call extend(options.options,
-    \ ['--preview', 'echo {} | grep -o "[a-f0-9]\{7,\}" | head -1 | xargs ' . prefix . 'show -O'.fzf#shellescape(orderfile).' --format=format: --color=always ' . suffix])
+    call extend(options.options, ['--preview', previewcmd . suffix])
   endif
 
   return s:fzf(a:buffer_local ? 'bcommits' : 'commits', options, args)
